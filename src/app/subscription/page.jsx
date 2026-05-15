@@ -1,0 +1,560 @@
+// src/app/subscription/page.jsx
+'use client';
+
+import { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import { auth, db } from '@/lib/firebase';
+import { onAuthStateChanged } from 'firebase/auth';
+import { doc, getDoc, collection, getDocs, query, orderBy, updateDoc } from 'firebase/firestore';
+import { PLANS } from '@/lib/stripe';
+import { Button } from '@/components/ui/button';
+import Link from 'next/link';
+
+export default function SubscriptionHistory() {
+    const [user, setUser] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [userPlanData, setUserPlanData] = useState(null);
+    const [paymentHistory, setPaymentHistory] = useState([]);
+    const [cancelSubscriptionLoading, setCancelSubscriptionLoading] = useState(false);
+    const [autoRenewLoading, setAutoRenewLoading] = useState(false);
+    const [successMessage, setSuccessMessage] = useState('');
+    const [errorMessage, setErrorMessage] = useState('');
+    const router = useRouter();
+    const [isSyncing, setIsSyncing] = useState(false);
+
+    useEffect(() => {
+        const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+            if (currentUser) {
+                setUser(currentUser);
+                fetchUserPlanData(currentUser.uid);
+            } else {
+                setUser(null);
+                setLoading(false);
+                router.push('/login'); // Redirect to login if not authenticated
+            }
+        });
+
+        return () => unsubscribe();
+    }, [router]);
+
+    useEffect(() => {
+        const syncSubscriptionStatus = async () => {
+          // Only sync if we're not already syncing and have the necessary data
+          if (!isSyncing && user && userPlanData?.subscriptionId?.id) {
+            try {
+              setIsSyncing(true);
+              const token = await user.getIdToken();
+              const response = await fetch('/api/subscription/sync-status', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${token}`
+                }
+              });
+              
+              if (response.ok) {
+                const result = await response.json();
+                // Only refresh if the status actually changed
+                if (result.status !== userPlanData.subscriptionId.status) {
+                  fetchUserPlanData(user.uid);
+                }
+              }
+            } catch (error) {
+              console.error('Error syncing subscription status:', error);
+            } finally {
+              setIsSyncing(false);
+            }
+          }
+        };
+        
+        syncSubscriptionStatus();
+      }, [user]);  // Only depend on user, not userPlanData
+
+    const fetchUserPlanData = async (userId) => {
+        try {
+            console.log('Fetching user plan data for user:', userId);
+            setLoading(true);
+
+            // Get user plan data directly (as it contains subscription info based on your screenshot)
+            const userPlanRef = doc(db, 'userPlans', userId);
+            const userPlanDoc = await getDoc(userPlanRef);
+
+            if (userPlanDoc.exists()) {
+                const planData = userPlanDoc.data();
+                console.log('User plan data:', planData);
+                setUserPlanData(planData);
+
+                // Try to fetch payment history if it exists
+                try {
+                    const paymentHistoryRef = collection(db, 'userPlans', userId, 'paymentHistory');
+                    const paymentHistoryQuery = query(paymentHistoryRef, orderBy('createdAt', 'desc'));
+                    const paymentHistorySnapshot = await getDocs(paymentHistoryQuery);
+
+                    const payments = [];
+                    paymentHistorySnapshot.forEach((doc) => {
+                        payments.push({ id: doc.id, ...doc.data() });
+                    });
+
+                    console.log('Payment history:', payments);
+                    setPaymentHistory(payments);
+                } catch (error) {
+                    console.log('No payment history subcollection found or error:', error);
+                    // Continue as payment history might not exist
+                }
+            } else {
+                console.log('No user plan data found');
+            }
+        } catch (error) {
+            console.error('Error fetching user plan data:', error);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const formatDate = (timestamp) => {
+        if (!timestamp) return 'N/A';
+        // If it's a number (Unix timestamp), convert to milliseconds
+        const date = typeof timestamp === 'number'
+            ? new Date(timestamp * 1000)
+            : new Date(timestamp);
+
+        return date.toLocaleDateString('en-US', {
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric'
+        });
+    };
+
+    const formatCurrency = (amount) => {
+        if (!amount && amount !== 0) return 'N/A';
+        return new Intl.NumberFormat('en-US', {
+            style: 'currency',
+            currency: 'USD',
+            minimumFractionDigits: 2
+        }).format(amount / 100); // Stripe amounts are in cents
+    };
+
+    // Determine next renewal date from billing_cycle_anchor
+    const getNextRenewalDate = () => {
+        if (!userPlanData?.subscriptionId?.billing_cycle_anchor) return 'N/A';
+
+        // The current timestamp appears to be stored in seconds (Unix timestamp)
+        const billingCycleAnchor = userPlanData.subscriptionId.billing_cycle_anchor;
+        const currentPeriodEnd = userPlanData.subscriptionId.current_period_end;
+
+        // Use the current_period_end value from the subscription data if available
+        // This is more accurate as it accounts for different billing intervals
+        if (currentPeriodEnd ) {
+          return formatDate(currentPeriodEnd);
+        }
+
+        // Fallback calculation - add 30 days (in seconds) to the billing cycle anchor
+        // Only use this if current_period_end is not available
+        const secondsInMonth = 30 * 24 * 60 * 60; // 30 days in seconds
+        // const secondsInMonth = 3 * 60 * 60; // 1 minute in seconds
+        const nextRenewalTimestamp = billingCycleAnchor + secondsInMonth;
+
+        return formatDate(nextRenewalTimestamp);
+    };
+
+    // Get current plan details based on the plan ID in userPlanData
+    const getCurrentPlanDetails = () => {
+        if (!userPlanData?.plan) return PLANS.FREE;
+
+        // Try to match by exact ID or by substring
+        const planId = userPlanData.plan;
+
+        return Object.values(PLANS).find(plan =>
+            plan.id === planId || planId.includes(plan.id.substring(6, 12))
+        ) || {
+            name: userPlanData.planName || 'Custom Plan',
+            price: 'Custom',
+            searchLimit: userPlanData.searchLimit || 0,
+            description: 'Custom subscription plan'
+        };
+    };
+
+    // Toggle auto-renew status (cancel at period end)
+    // Toggle auto-renew status (cancel at period end)
+const toggleAutoRenew = async () => {
+    if (!user || !userPlanData?.subscriptionId) return;
+
+    try {
+        setAutoRenewLoading(true);
+        setSuccessMessage('');
+        setErrorMessage('');
+
+        // Current value of cancel_at_period_end
+        const currentCancelAtPeriodEnd = userPlanData.subscriptionId.cancel_at_period_end === true;
+
+        // New value will be the opposite
+        const newCancelAtPeriodEnd = !currentCancelAtPeriodEnd;
+
+        console.log(`Toggling auto-renew from ${currentCancelAtPeriodEnd} to ${newCancelAtPeriodEnd}`);
+
+        // Get the current user's ID token
+        const token = await user.getIdToken();
+
+        // Call your backend API to update the subscription in Stripe
+        const response = await fetch('/api/subscription/toggle-auto-renew', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify({
+                subscriptionId: userPlanData.subscriptionId.id,
+                cancelAtPeriodEnd: newCancelAtPeriodEnd,
+            }),
+        });
+
+        console.log('API response status:', response.status);
+
+        // Check if the response is JSON (by looking at content-type header)
+        const contentType = response.headers.get('content-type');
+        let data;
+
+        if (contentType && contentType.includes('application/json')) {
+            data = await response.json();
+            console.log('API response data:', data);
+
+            if (!response.ok) {
+                throw new Error(data.message || 'Failed to update subscription');
+            }
+
+            // Success!
+            // Update in Firestore through client API
+            const userPlanRef = doc(db, 'userPlans', user.uid);
+            await updateDoc(userPlanRef, {
+                'subscriptionId.cancel_at_period_end': newCancelAtPeriodEnd,
+            });
+            console.log('Client-side Firestore update successful');
+
+            // Update local state - THIS IS THE FIXED PART
+            setUserPlanData(prevState => ({
+                ...prevState,
+                subscriptionId: {
+                    ...prevState.subscriptionId,
+                    cancel_at_period_end: newCancelAtPeriodEnd,
+                    status: 'active',
+                }
+            }));
+
+            setSuccessMessage(`Auto-renewal has been ${newCancelAtPeriodEnd ? 'disabled' : 'enabled'}`);
+        } else {
+            // Handle non-JSON response
+            const textResponse = await response.text();
+            console.error('Non-JSON response received:', textResponse);
+            throw new Error('Server returned an invalid response. Check console for details.');
+        }
+    } catch (error) {
+        console.error('Error toggling auto-renew:', error);
+        setErrorMessage(error.message || 'Failed to update auto-renew settings');
+    } finally {
+        setAutoRenewLoading(false);
+    }
+};
+
+    const checkSubscriptionStatus = (subscriptionData) => {
+        if (!subscriptionData) return 'inactive';
+    
+        const isActive = subscriptionData.status === 'active';
+        const cancelAtPeriodEnd = subscriptionData.cancel_at_period_end === true;
+        
+        // If subscription is set to cancel at period end
+        // If subscription is set to cancel at period end
+        if (cancelAtPeriodEnd && subscriptionData.current_period_end) {
+            const now = Math.floor(Date.now() / 1000); // Current time in seconds
+            if (now > subscriptionData.current_period_end) {
+                return 'expired';
+            }
+        }
+    
+        return isActive ? 'active' : 'inactive';
+    };
+
+    // Cancel subscription immediately (will remain active until end of current period)
+    const cancelSubscription = async () => {
+        if (!user || !userPlanData?.subscriptionId) return;
+        
+        // Confirm with user before proceeding
+        if (!window.confirm(`Are you sure you want to cancel your subscription? Your subscription will remain active until ${getNextRenewalDate()}, after which it will expire.`)) {
+          return;
+        }
+        
+        try {
+            setCancelSubscriptionLoading(true);
+            setSuccessMessage('');
+            setErrorMessage('');
+
+            // Get the current user's ID token - ADD THIS LINE
+            const token = await user.getIdToken();
+          
+            // Call your backend API to cancel the subscription in Stripe
+            const response = await fetch('/api/subscription/cancel', {
+                method: 'POST',
+                headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}` // ADD THIS LINE
+                },
+                body: JSON.stringify({
+                subscriptionId: userPlanData.subscriptionId.id,
+                }),
+            });
+          
+          if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.message || 'Failed to cancel subscription');
+          }
+          
+          // Update in Firestore - subscription remains active but will not renew
+          const userPlanRef = doc(db, 'userPlans', user.uid);
+          await updateDoc(userPlanRef, {
+            'subscriptionId.cancel_at_period_end': true,
+            'subscriptionId.status': 'active', // Still active until period ends
+          });
+          
+          // Update local state
+          setUserPlanData({
+            ...userPlanData,
+            subscriptionId: {
+              ...userPlanData.subscriptionId,
+              cancel_at_period_end: true,
+              status: 'active',
+            },
+          });
+          
+          setSuccessMessage(`Your subscription has been canceled. It will remain active until ${getNextRenewalDate()}.`);
+        } catch (error) {
+          console.error('Error canceling subscription:', error);
+          setErrorMessage(error.message || 'Failed to cancel subscription');
+        } finally {
+          setCancelSubscriptionLoading(false);
+        }
+    };
+
+    const currentPlan = userPlanData ? getCurrentPlanDetails() : null;
+
+    if (loading) {
+        return (
+            <div className="min-h-screen flex items-center justify-center pb-24 pt-1 md:pb-32 lg:pb-46 lg:pt-44">
+                <div className="text-center">
+                    <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500 mx-auto"></div>
+                    <p className="mt-4 text-gray-600">Loading subscription data...</p>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="min-h-screen bg-gray-50 py-8 px-4 sm:px-6 lg:px-8 pb-12 pt-28 md:pb-32 lg:pb-42 lg:pt-48">
+            <div className="max-w-4xl mx-auto">
+                <h1 className="text-3xl font-bold text-gray-900 mb-6">Subscription History</h1>
+
+                {successMessage && (
+                    <div className="bg-green-50 border-l-4 border-green-400 p-4 mb-6">
+                        <div className="flex">
+                            <div className="flex-shrink-0">
+                                <svg className="h-5 w-5 text-green-400" viewBox="0 0 20 20" fill="currentColor">
+                                    <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                                </svg>
+                            </div>
+                            <div className="ml-3">
+                                <p className="text-sm text-green-700">{successMessage}</p>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {errorMessage && (
+                    <div className="bg-red-50 border-l-4 border-red-400 p-4 mb-6">
+                        <div className="flex">
+                            <div className="flex-shrink-0">
+                                <svg className="h-5 w-5 text-red-400" viewBox="0 0 20 20" fill="currentColor">
+                                    <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                                </svg>
+                            </div>
+                            <div className="ml-3">
+                                <p className="text-sm text-red-700">{errorMessage}</p>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {!user && (
+                    <div className="bg-white shadow rounded-lg p-6 mb-6">
+                        <p className="text-gray-700">Please log in to view your subscription history.</p>
+                    </div>
+                )}
+
+                {user && currentPlan && (
+                    <div className="bg-white shadow rounded-lg p-6 mb-6">
+                        <h2 className="text-xl font-semibold text-gray-900 mb-4">Current Plan</h2>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <p className="text-sm text-gray-500">Plan</p>
+                                <p className="text-lg font-medium">{currentPlan.name}</p>
+                            </div>
+                            <div>
+                                <p className="text-sm text-gray-500">Price</p>
+                                <p className="text-lg font-medium">
+                                    {typeof currentPlan.price === 'number' ? `$${currentPlan.price}/month` : currentPlan.price}
+                                </p>
+                            </div>
+                            <div>
+                                <p className="text-sm text-gray-500">Search Limit</p>
+                                <p className="text-lg font-medium">{currentPlan.searchLimit} searches/month</p>
+                            </div>
+                            <div>
+                                <p className="text-sm text-gray-500">Searches Used</p>
+                                <p className="text-lg font-medium">{userPlanData?.searchesUsed || 0} searches</p>
+                            </div>
+                        </div>
+                        <Link href="/pricing">
+                            <Button className='mt-5'>
+                                See Plans
+                            </Button>
+                        </Link>
+                    </div>
+                )}
+
+                {user && userPlanData?.subscriptionId && (
+                    <div className="bg-white shadow rounded-lg p-6 mb-6">
+                        <h2 className="text-xl font-semibold text-gray-900 mb-4">Subscription Details</h2>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                            <div>
+                                <p className="text-sm text-gray-500">Billing Cycle Anchor</p>
+                                <p className="text-lg font-medium">
+                                    {formatDate(userPlanData.subscriptionId.billing_cycle_anchor)}
+                                </p>
+                            </div>
+                            <div>
+                                <p className="text-sm text-gray-500">Renewal Date</p>
+                                <p className="text-lg font-medium">{getNextRenewalDate()}</p>
+                            </div>
+                            <div>
+                                <p className="text-sm text-gray-500">Auto Renew</p>
+                                <p className="text-lg font-medium">
+                                    {userPlanData.subscriptionId.cancel_at_period_end === true ? 'No' : 'Yes'}
+                                </p>
+                            </div>
+                            <div>
+                                <p className="text-sm text-gray-500">Status</p>
+                                <p className={`text-lg font-medium ${checkSubscriptionStatus(userPlanData.subscriptionId) === 'active' ? 'text-green-600' :
+                                        checkSubscriptionStatus(userPlanData.subscriptionId) === 'expired' ? 'text-red-600' : 'text-yellow-600'
+                                    }`}>
+                                    {checkSubscriptionStatus(userPlanData.subscriptionId).charAt(0).toUpperCase() +
+                                        checkSubscriptionStatus(userPlanData.subscriptionId).slice(1)}
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="flex flex-col sm:flex-row gap-4">
+                            <button
+                                onClick={toggleAutoRenew}
+                                disabled={autoRenewLoading}
+                                className={`inline-flex items-center justify-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white 
+                  ${userPlanData.subscriptionId.cancel_at_period_end ? 'bg-green-600 hover:bg-green-700' : 'bg-yellow-600 hover:bg-yellow-700'} 
+                  focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50`}
+                            >
+                                {autoRenewLoading ? (
+                                    <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                    </svg>
+                                ) : null}
+                                {userPlanData.subscriptionId.cancel_at_period_end ? 'Enable Auto-Renew' : 'Disable Auto-Renew'}
+                            </button>
+
+                            <button
+                                onClick={cancelSubscription}
+                                disabled={cancelSubscriptionLoading || userPlanData.subscriptionId.cancel_at_period_end === true}
+                                className={`inline-flex items-center justify-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm 
+                  text-white bg-red-600 hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 
+                  disabled:opacity-50 disabled:cursor-not-allowed`}
+                            >
+                                {cancelSubscriptionLoading ? (
+                                    <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                    </svg>
+                                ) : null}
+                                Cancel Subscription
+                            </button>
+                        </div>
+
+                        {/* {userPlanData.subscriptionId.cancel_at_period_end && (
+                            <p className="mt-2 text-sm text-gray-500">
+                                Your subscription is scheduled to cancel on {getNextRenewalDate()}. You won't be charged after this date.
+                            </p>
+                        )} */}
+                    </div>
+                )}
+
+                {user && (
+                    <div className="bg-white shadow rounded-lg p-6">
+                        <h2 className="text-xl font-semibold text-gray-900 mb-4">Payment History</h2>
+
+                        {paymentHistory.length === 0 ? (
+                            <div>
+                                {/* <p className="text-gray-700 mb-4">No detailed payment history available in database.</p> */}
+
+                                {userPlanData?.subscriptionId?.billing_cycle_anchor && (
+                                    <div className="border rounded-md p-4 bg-gray-50">
+                                        <h3 className="font-medium text-gray-900 mb-2">Last Payment</h3>
+                                        <p className="mb-1"><span className="font-medium">Date:</span> {formatDate(userPlanData.subscriptionId.billing_cycle_anchor)}</p>
+                                        <p className="mb-1"><span className="font-medium">Amount:</span> {currentPlan ? `$${currentPlan.price}` : 'N/A'}</p>
+                                        <p><span className="font-medium">Status:</span> Completed</p>
+                                    </div>
+                                )}
+                            </div>
+                        ) : (
+                            <div className="overflow-x-auto">
+                                <table className="min-w-full divide-y divide-gray-200">
+                                    <thead className="bg-gray-50">
+                                        <tr>
+                                            <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                Date
+                                            </th>
+                                            <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                Payment ID
+                                            </th>
+                                            <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                Amount
+                                            </th>
+                                            <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                Status
+                                            </th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="bg-white divide-y divide-gray-200">
+                                        {paymentHistory.map((payment) => (
+                                            <tr key={payment.id}>
+                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                                                    {formatDate(payment.date)}
+                                                </td>
+                                                <td className="px-6 py-4 whitespace-nowrap text-sm font-mono text-gray-500">
+                                                    {payment.paymentId}
+                                                </td>
+                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                                                    {formatCurrency(payment.amount)}
+                                                </td>
+                                                <td className="px-6 py-4 whitespace-nowrap">
+                                                    <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${payment.status === 'succeeded' ? 'bg-green-100 text-green-800' :
+                                                            payment.status === 'failed' ? 'bg-red-100 text-red-800' : 'bg-yellow-100 text-yellow-800'
+                                                        }`}>
+                                                        {payment.status ? payment.status.charAt(0).toUpperCase() + payment.status.slice(1) : 'Unknown'}
+                                                    </span>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}

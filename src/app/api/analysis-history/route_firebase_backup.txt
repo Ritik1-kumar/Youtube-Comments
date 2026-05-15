@@ -1,0 +1,77 @@
+// src/app/api/analysis-history/route.js
+import { NextResponse } from 'next/server';
+import { db } from '@/lib/firebase';
+import { collection, getDocs, addDoc, query, orderBy, where, doc, getDoc, updateDoc } from 'firebase/firestore';
+
+const analysisCollection = 'youtube-analysis';
+
+// Get all analysis history
+export async function GET() {
+  try {
+    const analysisRef = collection(db, analysisCollection);
+    const q = query(analysisRef, orderBy('date', 'desc'));
+    const querySnapshot = await getDocs(q);
+    
+    const history = [];
+    querySnapshot.forEach((doc) => {
+      history.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+    
+    return NextResponse.json(history);
+  } catch (error) {
+    console.error('Error fetching analysis history:', error);
+    return NextResponse.json({ error: 'Failed to fetch analysis history' }, { status: 500 });
+  }
+}
+
+// Save or update analysis
+export async function POST(req) {
+  try {
+    const analysisData = await req.json();
+    
+    if (!analysisData.url || !analysisData.title) {
+      return NextResponse.json({ error: 'URL and title are required' }, { status: 400 });
+    }
+    
+    // Prepare the analysis data
+    const newAnalysis = {
+      ...analysisData,
+      date: analysisData.date || new Date().toISOString(),
+      thumbnail: analysisData.thumbnail || null,
+    };
+    
+    // Check if we have an ID (for updates)
+    if (analysisData.id) {
+      // Update existing document
+      const docRef = doc(db, analysisCollection, analysisData.id);
+      const docSnap = await getDoc(docRef);
+      
+      if (docSnap.exists()) {
+        await updateDoc(docRef, newAnalysis);
+        return NextResponse.json({ success: true, id: analysisData.id, updated: true });
+      }
+    }
+    
+    // Check if we already have this URL in the database
+    const analysisRef = collection(db, analysisCollection);
+    const q = query(analysisRef, where('url', '==', analysisData.url));
+    const querySnapshot = await getDocs(q);
+    
+    // If URL exists, update that document instead of creating a new one
+    if (!querySnapshot.empty) {
+      const existingDoc = querySnapshot.docs[0];
+      await updateDoc(doc(db, analysisCollection, existingDoc.id), newAnalysis);
+      return NextResponse.json({ success: true, id: existingDoc.id, updated: true });
+    }
+    
+    // If no matching document found, create a new one
+    const docRef = await addDoc(collection(db, analysisCollection), newAnalysis);
+    return NextResponse.json({ success: true, id: docRef.id, updated: false });
+  } catch (error) {
+    console.error('Error saving analysis:', error);
+    return NextResponse.json({ error: 'Failed to save analysis' }, { status: 500 });
+  }
+}

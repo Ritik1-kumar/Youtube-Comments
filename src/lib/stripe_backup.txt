@@ -1,0 +1,203 @@
+// src/lib/stripe.js
+import { loadStripe } from '@stripe/stripe-js';
+import { db, auth } from '@/lib/firebase';
+import { doc, setDoc, getDoc, updateDoc, collection, addDoc, serverTimestamp } from 'firebase/firestore';
+import { toast } from 'sonner';
+
+// Initialize Stripe with your publishable key
+const stripePromise = loadStripe(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY);
+
+// Constants for the subscription plans
+export const PLANS = {
+  FREE: {
+    name: 'Free',
+    price: 0,
+    searchLimit: 5,
+    id: 'price_1R1PmPE8ZRUXcvaUTGIabL4k', // This should match your Stripe price ID
+    description: '5 searches included'
+  },
+  BASIC: {
+    name: 'Basic',
+    price: 10,
+    searchLimit: 100,
+    id: 'price_1R1Pn0E8ZRUXcvaUN5frxwpt', // This should match your Stripe price ID
+    description: '100 searches included'
+  },
+  PRO: {
+    name: 'Pro',
+    price: 50,
+    searchLimit: 1000,
+    id: 'price_1R1PnPE8ZRUXcvaU90jXxoxE', // This should match your Stripe price ID
+    description: '1000 searches included'
+  }
+};
+
+// Initialize a user's plan to Free when they sign up
+export const initializeUserPlan = async (userId) => {
+  const userPlanRef = doc(db, 'userPlans', userId);
+  
+  try {
+    const userPlanDoc = await getDoc(userPlanRef);
+    
+    if (!userPlanDoc.exists()) {
+      // Set default plan data
+      await setDoc(userPlanRef, {
+        plan: PLANS.FREE.id,
+        searchesUsed: 0,
+        searchLimit: PLANS.FREE.searchLimit,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp()
+      });
+    }
+    return true;
+  } catch (error) {
+    console.error('Error initializing user plan:', error);
+    return false;
+  }
+};
+
+// Check if the user has searches remaining
+export const checkSearchAvailability = async (userId) => {
+  if (!userId) return { available: false, message: 'User not authenticated' };
+  
+  try {
+    const userPlanRef = doc(db, 'userPlans', userId);
+    const userPlanDoc = await getDoc(userPlanRef);
+    
+    if (!userPlanDoc.exists()) {
+      await initializeUserPlan(userId);
+      return { available: true, remaining: PLANS.FREE.searchLimit };
+    }
+    
+    const userData = userPlanDoc.data();
+    const remaining = userData.searchLimit - userData.searchesUsed;
+    
+    return { 
+      available: remaining > 0, 
+      remaining,
+      plan: userData.plan,
+      searchesUsed: userData.searchesUsed,
+      searchLimit: userData.searchLimit
+    };
+  } catch (error) {
+    console.error('Error checking search availability:', error);
+    return { available: false, message: 'Error checking search availability' };
+  }
+};
+
+// Increment the searches used count
+export const incrementSearchCount = async (userId) => {
+  if (!userId) return false;
+  
+  try {
+    const userPlanRef = doc(db, 'userPlans', userId);
+    const userPlanDoc = await getDoc(userPlanRef);
+    
+    if (!userPlanDoc.exists()) {
+      await initializeUserPlan(userId);
+      await updateDoc(userPlanRef, {
+        searchesUsed: 1,
+        updatedAt: serverTimestamp()
+      });
+      return true;
+    }
+    
+    const userData = userPlanDoc.data();
+    
+    // Only increment if below limit
+    if (userData.searchesUsed < userData.searchLimit) {
+      await updateDoc(userPlanRef, {
+        searchesUsed: userData.searchesUsed + 1,
+        updatedAt: serverTimestamp()
+      });
+      return true;
+    }
+    
+    return false;
+  } catch (error) {
+    console.error('Error incrementing search count:', error);
+    return false;
+  }
+};
+
+// Create a checkout session for a plan
+export const createCheckoutSession = async (priceId, userId) => {
+    if (!userId) throw new Error('User not authenticated');
+    
+    try {
+      // Call the API route to create a checkout session
+      const response = await fetch('/api/create-checkout-session', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ priceId, userId }),
+      });
+      
+      if (!response.ok) {
+        const errorData = await response.json();
+        console.error('Checkout session error details:', errorData);
+        throw new Error(errorData.error || 'Failed to create checkout session');
+      }
+      
+      const data = await response.json();
+      
+      if (!data.sessionId) {
+        throw new Error('Failed to create checkout session');
+      }
+      
+      // Redirect to checkout
+      const stripe = await stripePromise;
+      const { error } = await stripe.redirectToCheckout({
+        sessionId: data.sessionId,
+      });
+      
+      if (error) {
+        console.error('Redirect error:', error);
+        throw new Error(error.message);
+      }
+      
+    } catch (error) {
+      console.error('Error creating checkout session:', error);
+      throw error;
+    }
+  };
+
+// Update user plan after successful payment
+export const updateUserPlan = async (userId, planId) => {
+  if (!userId) return false;
+  
+  try {
+    const userPlanRef = doc(db, 'userPlans', userId);
+    
+    let planDetails;
+    if (planId === PLANS.BASIC.id) {
+      planDetails = PLANS.BASIC;
+    } else if (planId === PLANS.PRO.id) {
+      planDetails = PLANS.PRO;
+    } else {
+      planDetails = PLANS.FREE;
+    }
+    
+    await updateDoc(userPlanRef, {
+      plan: planId,
+      searchLimit: planDetails.searchLimit,
+      updatedAt: serverTimestamp()
+    });
+    
+    return true;
+  } catch (error) {
+    console.error('Error updating user plan:', error);
+    return false;
+  }
+};
+
+export default {
+  stripePromise,
+  PLANS,
+  initializeUserPlan,
+  checkSearchAvailability,
+  incrementSearchCount,
+  createCheckoutSession,
+  updateUserPlan
+};

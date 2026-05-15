@@ -1,0 +1,157 @@
+// src/app/api/webhooks/route.js
+
+import { NextResponse } from 'next/server';
+import Stripe from 'stripe';
+import { getFirestore } from 'firebase-admin/firestore';
+import { initializeApp, getApps, cert } from 'firebase-admin/app';
+import { PLANS } from '@/lib/stripe';
+
+// Initialize Firebase Admin if not already initialized
+if (!getApps().length) {
+  initializeApp({
+    credential: cert({
+      projectId: process.env.FIREBASE_ADMIN_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_ADMIN_CLIENT_EMAIL,
+      privateKey: process.env.FIREBASE_ADMIN_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    }),
+  });
+}
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+const db = getFirestore();
+
+export async function POST(request) {
+  if (request.method !== 'POST') {
+    return NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
+  }
+
+  // Get the signature from the header
+  const signature = request.headers.get('stripe-signature');
+  if (!signature) {
+    return NextResponse.json({ error: 'No signature provided' }, { status: 400 });
+  }
+
+  try {
+    // Get raw body as text directly from the Request object
+    const body = await request.text();
+    let event;
+
+    try {
+      // Verify the webhook signature
+      event = stripe.webhooks.constructEvent(
+        body,
+        signature,
+        webhookSecret
+      );
+    } catch (err) {
+      console.error(`Webhook signature verification failed: ${err.message}`);
+      return NextResponse.json({ error: `Webhook Error: ${err.message}` }, { status: 400 });
+    }
+
+    console.log(`Webhook received: ${event.type}`);
+
+    // Handle the checkout.session.completed event
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      console.log('Session completed:', session.id);
+      
+      // Get the userId from the metadata
+      const userId = session.metadata?.userId || session.client_reference_id;
+      if (!userId) {
+        console.error('No userId found in session metadata or client_reference_id');
+        return NextResponse.json({ error: 'No userId in metadata or reference' }, { status: 400 });
+      }
+
+      console.log('User ID from session:', userId);
+
+      // Get the subscription ID from the session
+      const subscriptionId = session.subscription;
+      if (!subscriptionId) {
+        console.error('No subscription ID found in session');
+        return NextResponse.json({ error: 'No subscription ID' }, { status: 400 });
+      }
+
+      console.log('Subscription ID:', subscriptionId);
+
+      // Get subscription details to get the price ID
+      const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+      const priceId = subscription.items.data[0].price.id;
+      
+      console.log('Price ID from subscription:', priceId);
+
+      // Directly update Firestore with the user's plan
+      try {
+        const userPlanRef = db.collection('userPlans').doc(userId);
+        
+        // Determine plan details based on priceId - using exact string comparison
+        let searchLimit;
+        if (priceId === PLANS.BASIC.id) {
+          searchLimit = PLANS.BASIC.searchLimit;
+        } else if (priceId === PLANS.PRO.id) {
+          searchLimit = PLANS.PRO.searchLimit;
+        } else {
+          searchLimit = PLANS.FREE.searchLimit;
+        }
+        
+        console.log(`Updating user ${userId} to plan ${priceId} with search limit ${searchLimit}`);
+        
+        // Update the user's plan
+        await userPlanRef.set({
+          plan: priceId,
+          searchLimit: searchLimit,
+          searchesUsed: 0, // Reset searches used when upgrading
+          updatedAt: new Date()
+        }, { merge: true });
+        
+        console.log(`Successfully updated user ${userId} to plan ${priceId}`);
+      } catch (error) {
+        console.error('Error updating user plan in Firestore:', error);
+      }
+
+      // Update the checkout session status in Firestore
+      try {
+        const checkoutSessionRef = db.collection('users')
+          .doc(userId)
+          .collection('checkout_sessions')
+          .where('sessionId', '==', session.id);
+        
+        const checkoutSessionSnapshot = await checkoutSessionRef.get();
+        if (!checkoutSessionSnapshot.empty) {
+          const docId = checkoutSessionSnapshot.docs[0].id;
+          await db.collection('users')
+            .doc(userId)
+            .collection('checkout_sessions')
+            .doc(docId)
+            .update({
+              status: 'complete',
+              updatedAt: new Date()
+            });
+          
+          console.log(`Updated checkout session ${session.id} status to complete`);
+        } else {
+          console.log(`Checkout session ${session.id} not found in Firestore`);
+        }
+      } catch (error) {
+        console.error('Error updating checkout session status:', error);
+      }
+    }
+
+    return NextResponse.json({ received: true });
+    
+  } catch (error) {
+    console.error(`Webhook error: ${error.message}`);
+    return NextResponse.json(
+      { error: `Webhook error: ${error.message}` },
+      { status: 500 }
+    );
+  }
+}
+
+// Configuration for the API route
+export const config = {
+  api: {
+    // Disable body parsing, as we need the raw body for webhook verification
+    bodyParser: false,
+  },
+};
